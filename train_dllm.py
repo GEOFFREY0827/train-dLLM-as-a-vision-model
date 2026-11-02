@@ -190,9 +190,21 @@ def recognition_acc(model, x, vocab, bs=256):
     return correct / len(x)
 
 
+SAMPLE_ORDERS = ("confidence", "random", "ink_first")
+
+
 @torch.no_grad()
-def generate(model, vocab, y, W, H, steps=32, temp=1.0, device="cpu"):
-    """Label-conditioned sampling: start all-masked, each step keep the most confident cells."""
+def generate(model, vocab, y, W, H, steps=64, temp=1.0, order="random", device="cpu"):
+    """
+    Label-conditioned sampling: start with an all-masked canvas, unmask a batch of cells per step.
+    Which cells get committed each step:
+      confidence : highest-confidence cells first (LLaDA/MaskGIT default). Blank cells are the
+                   easiest to predict, so they get locked first and the canvas tends to collapse
+                   to empty -- the canvas analogue of premature trailing EOS.
+      random     : uniformly random cells (plain MDLM ancestral sampling).
+      ink_first  : confidence order, but cells whose sampled char is a space are ranked last,
+                   so strokes are committed before background.
+    """
     model.eval()
     n = W * H
     x = torch.tensor([[vocab.OPEN] + [vocab.MASK] * n + [vocab.CLOSE, vocab.LABEL, vocab.cls0 + y]], device=device)
@@ -205,11 +217,24 @@ def generate(model, vocab, y, W, H, steps=32, temp=1.0, device="cpu"):
         cand = torch.multinomial(probs, 1).squeeze(-1)
         conf = probs.gather(-1, cand[:, None]).squeeze(-1)
         remain = math.cos(math.pi / 2 * (s + 1) / steps)          # cosine schedule
-        k = max(1, len(masked) - int(round(remain * n)))
-        keep = conf.topk(min(k, len(masked))).indices
+        k = min(len(masked), max(1, len(masked) - int(round(remain * n))))
+        if order == "confidence":
+            score = conf
+        elif order == "random":
+            score = torch.rand_like(conf)
+        elif order == "ink_first":
+            score = conf - 2.0 * (cand == 0).float()                # cand index 0 = ' '
+        else:
+            raise ValueError(order)
+        keep = score.topk(k).indices
         x[0, masked[keep]] = cand[keep] + vocab.char0
     model.train()
     return vocab.decode_grid(x[0, 1:n + 1].tolist(), W)
+
+
+def ink_fraction(grid):
+    cells = "".join(grid)
+    return sum(c != " " for c in cells) / max(1, len(cells))
 
 
 # ------------------------------------------------------------------ main
@@ -233,6 +258,9 @@ def main():
     ap.add_argument("--conv", action="store_true", help="2D token conv after each layer")
     ap.add_argument("--kernel", default="3x3", help="conv kernel as ROWSxCOLS, e.g. 3x3, 3x5, 1x1")
     ap.add_argument("--results", default="results.csv", help="append final metrics here")
+    ap.add_argument("--sample_orders", default="confidence,random,ink_first",
+                    help=f"comma-separated subset of {SAMPLE_ORDERS}")
+    ap.add_argument("--gen_steps", type=int, default=64)
     ap.add_argument("--eval_every", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="ckpt")
@@ -285,22 +313,35 @@ def main():
            f"_conv{conv_desc}_sw{a.space_weight}_seed{a.seed}")
     torch.save({"model": model.state_dict(), "args": vars(a)}, f"{a.out}/{tag}.pt")
 
-    print("\n=== label-conditioned samples ===")
-    samples = []
-    for y, name in enumerate(classes):
-        with torch.autocast(**amp):
-            g = generate(model, vocab, y, a.W, a.H, device=dev)
-        samples.append(f"--- {name} ---\n" + "\n".join(g))
-        print(samples[-1])
-    with open(f"{a.out}/{tag}_samples.txt", "w") as f:
+    # reference: how much of a real canvas is ink
+    lab = xte.shape[1] - 1
+    real_ink = (xte[:, 1:lab - 2] != vocab.SPACE).float().mean().item()
+    print(f"\nreal test canvases: ink fraction {real_ink:.3f}")
+
+    samples, ink = [], {}
+    for order in a.sample_orders.split(","):
+        print(f"\n=== label-conditioned samples | order = {order} ===")
+        fr = []
+        for y, name in enumerate(classes):
+            with torch.autocast(**amp):
+                g = generate(model, vocab, y, a.W, a.H, steps=a.gen_steps, order=order, device=dev)
+            fr.append(ink_fraction(g))
+            samples.append(f"--- [{order}] {name} ---\n" + "\n".join(g))
+            print(samples[-1])
+        ink[order] = sum(fr) / len(fr)
+        print(f"[{order}] mean ink fraction {ink[order]:.3f} (real {real_ink:.3f})")
+    with open(f"{a.out}/{tag}_samples.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(samples) + "\n")
 
     new = not os.path.exists(a.results)
-    with open(a.results, "a") as f:
+    ink_cols = ",".join(f"ink_{o}" for o in SAMPLE_ORDERS)
+    ink_vals = ",".join(f"{ink[o]:.3f}" if o in ink else "" for o in SAMPLE_ORDERS)
+    with open(a.results, "a", encoding="utf-8") as f:
         if new:
-            f.write("source,style,pos2d,conv,space_weight,seed,steps,params_M,test_acc,minutes\n")
+            f.write(f"source,style,pos2d,conv,space_weight,seed,steps,params_M,test_acc,"
+                    f"ink_real,{ink_cols},minutes\n")
         f.write(f"{a.source},{a.style},{not a.no_2d},{conv_desc},{a.space_weight},{a.seed},{a.steps},"
-                f"{n_params / 1e6:.3f},{acc:.4f},{(time.time() - t0) / 60:.1f}\n")
+                f"{n_params / 1e6:.3f},{acc:.4f},{real_ink:.3f},{ink_vals},{(time.time() - t0) / 60:.1f}\n")
     print(f"\nappended to {a.results}: conv {conv_desc} | acc {acc:.4f}")
 
 
