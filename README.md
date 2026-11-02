@@ -52,7 +52,13 @@ python train_dllm.py --source mnist  --style mixed        # main run
 python train_dllm.py --source mnist  --style mixed --conv # + 2D token conv
 python train_dllm.py --source mnist  --style mixed --no_2d
 python train_dllm.py --source mnist  --space_weight 0.3   # down-weight blank cells
+python train_dllm.py --source mnist  --conv --kernel 3x5  # kernel = ROWSxCOLS
+
+bash sweep_kernel.sh                         # off / 1x1 / 3x3 / 3x5 / 5x5 / 1x5 / 3x1
+bash sweep_kernel.sh mnist mixed 10000 0 1 2 # same, 3 seeds
 ```
+
+Every run appends a row to `results.csv` and writes its samples to `ckpt/*_samples.txt`.
 
 The default config (~5M params, 32x16 canvas) fits on an 8 GB GPU.
 

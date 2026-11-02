@@ -77,15 +77,19 @@ def build_dataset(source, style, n, W, H, vocab, train, seed, cache_dir="cache")
 # ------------------------------------------------------------------ model
 class GridConv(nn.Module):
     """
-    2D token convolution on the canvas cells: [B, W*H, d] -> [B, d, H, W] -> depthwise kxk conv
+    2D token convolution on the canvas cells: [B, W*H, d] -> [B, d, H, W] -> depthwise kh x kw conv
     -> pointwise -> residual. Non-canvas positions pass through untouched.
     The pointwise layer is zero-initialised, so the block starts as an identity.
+    kernel=(kh, kw) in (rows, cols); cells are ~2x taller than wide, so e.g. 3x5 covers a
+    roughly square physical area. (1, 1) adds the same parameters with no spatial mixing.
     """
-    def __init__(self, d, W, H, k=3):
+    def __init__(self, d, W, H, kernel=(3, 3)):
         super().__init__()
         self.W, self.H = W, H
+        kh, kw = kernel
+        assert kh % 2 == 1 and kw % 2 == 1, "kernel sizes must be odd"
         self.norm = nn.LayerNorm(d)
-        self.dw = nn.Conv2d(d, d, k, padding=k // 2, groups=d)
+        self.dw = nn.Conv2d(d, d, (kh, kw), padding=(kh // 2, kw // 2), groups=d)
         self.pw = nn.Linear(d, d)
         nn.init.zeros_(self.pw.weight)
         nn.init.zeros_(self.pw.bias)
@@ -101,7 +105,7 @@ class GridConv(nn.Module):
 
 class GridTransformer(nn.Module):
     """Bidirectional transformer (no causal mask) = the dLLM denoiser."""
-    def __init__(self, vocab_size, W, H, d=256, layers=6, heads=8, use_2d=True, conv=False):
+    def __init__(self, vocab_size, W, H, d=256, layers=6, heads=8, use_2d=True, conv=None):
         super().__init__()
         self.L = W * H + 4
         self.use_2d = use_2d
@@ -122,7 +126,8 @@ class GridTransformer(nn.Module):
             nn.TransformerEncoderLayer(d, heads, 4 * d, dropout=0.0, activation="gelu",
                                        batch_first=True, norm_first=True)
             for _ in range(layers)])
-        self.convs = nn.ModuleList([GridConv(d, W, H) for _ in range(layers)]) if conv else None
+        # conv = None (off) or a (kh, kw) kernel shape
+        self.convs = nn.ModuleList([GridConv(d, W, H, conv) for _ in range(layers)]) if conv else None
         self.norm = nn.LayerNorm(d)
         self.head = nn.Linear(d, vocab_size, bias=False)
         self.head.weight = self.tok.weight                         # tie embeddings
@@ -226,6 +231,8 @@ def main():
     ap.add_argument("--space_weight", type=float, default=1.0)
     ap.add_argument("--no_2d", action="store_true", help="disable row/col embeddings")
     ap.add_argument("--conv", action="store_true", help="2D token conv after each layer")
+    ap.add_argument("--kernel", default="3x3", help="conv kernel as ROWSxCOLS, e.g. 3x3, 3x5, 1x1")
+    ap.add_argument("--results", default="results.csv", help="append final metrics here")
     ap.add_argument("--eval_every", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="ckpt")
@@ -241,10 +248,13 @@ def main():
     xtr = build_dataset(a.source, a.style, a.n_train, a.W, a.H, vocab, True, a.seed).to(dev)
     xte = build_dataset(a.source, a.style, a.n_test, a.W, a.H, vocab, False, a.seed).to(dev)
 
+    kernel = tuple(int(v) for v in a.kernel.lower().split("x")) if a.conv else None
     model = GridTransformer(len(vocab), a.W, a.H, a.d, a.layers, a.heads,
-                            use_2d=not a.no_2d, conv=a.conv).to(dev)
-    print(f"params: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M | seq len {model.L} | "
-          f"2D pos {'off' if a.no_2d else 'on'} | conv {'on' if a.conv else 'off'} | device {dev}")
+                            use_2d=not a.no_2d, conv=kernel).to(dev)
+    n_params = sum(p.numel() for p in model.parameters())
+    conv_desc = f"{kernel[0]}x{kernel[1]}" if kernel else "off"
+    print(f"params: {n_params / 1e6:.2f}M | seq len {model.L} | "
+          f"2D pos {'off' if a.no_2d else 'on'} | conv {conv_desc} | device {dev}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=0.01, betas=(0.9, 0.98))
     warm = 500
@@ -271,15 +281,27 @@ def main():
             print(f"== step {step} | test recognition acc {acc:.3f}")
 
     os.makedirs(a.out, exist_ok=True)
-    tag = f"{a.source}_{a.style}{'_no2d' if a.no_2d else ''}{'_conv' if a.conv else ''}"
+    tag = (f"{a.source}_{a.style}{'_no2d' if a.no_2d else ''}"
+           f"_conv{conv_desc}_sw{a.space_weight}_seed{a.seed}")
     torch.save({"model": model.state_dict(), "args": vars(a)}, f"{a.out}/{tag}.pt")
 
     print("\n=== label-conditioned samples ===")
+    samples = []
     for y, name in enumerate(classes):
         with torch.autocast(**amp):
             g = generate(model, vocab, y, a.W, a.H, device=dev)
-        print(f"--- {name} ---")
-        print("\n".join(g))
+        samples.append(f"--- {name} ---\n" + "\n".join(g))
+        print(samples[-1])
+    with open(f"{a.out}/{tag}_samples.txt", "w") as f:
+        f.write("\n".join(samples) + "\n")
+
+    new = not os.path.exists(a.results)
+    with open(a.results, "a") as f:
+        if new:
+            f.write("source,style,pos2d,conv,space_weight,seed,steps,params_M,test_acc,minutes\n")
+        f.write(f"{a.source},{a.style},{not a.no_2d},{conv_desc},{a.space_weight},{a.seed},{a.steps},"
+                f"{n_params / 1e6:.3f},{acc:.4f},{(time.time() - t0) / 60:.1f}\n")
+    print(f"\nappended to {a.results}: conv {conv_desc} | acc {acc:.4f}")
 
 
 if __name__ == "__main__":
