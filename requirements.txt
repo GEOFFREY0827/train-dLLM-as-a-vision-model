@@ -1,0 +1,5 @@
+torch>=2.1
+torchvision
+numpy
+Pillow
+transformers  # only for char_tokenizer.py --model
